@@ -279,6 +279,29 @@ with implicit prefetching in FSDP"。
 
 ---
 
+### 4.5 激活卸载对 FSDP2 通信的影响（r 系列实测，2026-10-31）
+
+在 4L/8exp 缩小版（4 卡，EP2/dp_shard4，Muon，GBS8）上用 MindSpeed 式块级
+`saved_tensors_hooks`（`override/common/act_offload.py`，流量忠实/显存中性）做了
+0 → 1.88 → 8.32 → 10.54 GB/步 的卸载量扫描（详见
+`verify_act_offload/OFFLOAD_ANALYSIS.md` §3.6）：
+
+- **通信结构完全不变**：AG 13f/31b、RS 24、A2A 16f/50b、AR 7 在所有卸载档计数一致；
+  compute busy 持平（1.50–1.55s）。激活卸载不改变 FSDP2 的通信算子集合，只影响时序。
+- **受影响算子 = 反向 ReduceScatter**（梯度分片回写）：med 25.7 → 39.4（+53% @1.88GB）
+  → 47.1ms（+83% @10.54GB），max 至 179ms；busy 仅在 10.54GB/步跳变 0.66→1.57s（+138%）。
+- 前向 A2A med 微增 ≤9%（2.75→3.00ms）；AG/AR 无感。
+- **步时近线性 +0.05~0.08 s/GB，无悬崖**；通信显著劣化临界量 ≈ 9–10GB/步
+  （本配置 = 每层前向卸载 ~1.3GB 边界激活的 100% 场景）。
+- 机理（推断）：unpack H2D 与侧流事件插在 bwd 计算间，推迟梯度就绪 → RS 等 peers
+  拉长；超过 bwd 可藏窗口后等待实质占用通信流。
+- 对 43L 的外推（推断）：只卸边界张量 ≈2.4GB/步，落在"被掩盖"档，预计步时 +5~10%。
+
+判定方法沿用 §4.4（等待 vs 带宽、空隙归因）；本次的增量判据是
+**"单次集合通信时长膨胀但 busy 持平 = 被掩盖的劣化；busy 跳变 = 实质劣化"**。
+
+---
+
 ## 5. 优化建议（按收益排序）
 
 1. **采集规范**：全 rank 只开设备侧采集；stack/memory 仅个别 rank、仅在需要看 Python 栈时。
