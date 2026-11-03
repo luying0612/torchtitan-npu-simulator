@@ -99,71 +99,86 @@ lookahead）。mesh 展平 `('edp','efsdp','ep')` → efsdp 对 = 连续对 {0,1
 
 **三条路径**：
 
-| | MindSpeed fsdp2 | 本仓库 eager（fsdp.py:174-183，E8 实测） | 本仓库 spmd（本次实测） |
+| | MindSpeed fsdp2 | 本仓库 eager（fsdp.py:226-233，E8 实测） | 本仓库 spmd（common_utils.py:410） |
 |---|---|---|---|
-| 专家权重 | ep 组内 4 完整专家 × **efsdp 切 F 半**（默认 efsdp=1 不切 = 4 完整专家；开启 = 2 专家当量） | edp mesh 上 Shard(0) 切 dim0(E)；**E8 实测通信结构与 spmd 完全一致**（AG 178/RS 90，无额外单元级 AG） | **4 完整专家/rank，efsdp 复制** |
-| 用前通信 | efsdp AG（2 卡，~小；默认关则无） | 与 spmd 相同的 AG 骨架（仅 mesh 不同） | 无 |
+| 专家权重 | **默认 Shard(1)** 切 F/hidden 维（可配 shard_by_dim_0）；efsdp 组内 4 完整专家 × F 半 | Shard(0) 切 dim0(E)，efsdp×ep=8 路切 → 2 专家/rank；饱和时降 Shard(1)；**E8 实测通信结构与 spmd 完全一致** | 与 eager 同款逻辑与判据（2.3 节代码引用） |
+| 用前通信 | efsdp AG（2 卡，payload≈本地专家权重一半） | efsdp AG 前向+反向重取、RS 梯度（43 层×3 = 86/86/43 每步，实测见 2.3） | 同 eager |
 | a2a 组 | 4 卡（ep 组） | 4 卡（ep 组，`token_dispatcher.py:209 ep_mesh.get_group()`） | 4 卡（ep 组，实测） |
 | 优化器状态 | 分散式优化器 + ep 除数 | 标准 FSDP2 分片 | flex_shard 按 ('ep','efsdp') 8 路切 E + 组间 RS/AG |
 | 选择方式 | — | spmd-backend 未设 spmd_types | `--parallelism.spmd-backend spmd_types`（dsv4 调试脚本默认） |
 
-**开 EP 的收益（两仓库同理）**：ep=1 时专家权重虽 8 路切（2 专家/rank），但每次 GMM 前
-要 AG 全量 16 专家（805MB bf16 × 43 层 × 3 相位 ≈ 100GB/step）——EP 让专家驻留、
-零权重 AG，用 +202MB/rank 驻留换掉 100GB 流量与 805MB 瞬时缓冲。
+**开 EP 的收益（2026-11-03 修正表述）**：ep=1 与 ep=4 的专家权重**驻留量相同**
+（都 ≈2 专家/rank：ep=1 时 fsdp=8 全体切 E；ep=4 时 ep×efsdp=8 切 E）。EP 改变的是
+**计算与通信形态**：ep=1 时 module 级 unshard 要 AG 全量 16 专家（805MB×43×2 ≈ 69GB/step），
+且每 rank 对本地 token 冗余计算全部 16 专家；EP=4 后 a2a 把 token 送到专家所在卡，
+每层只 AG 本地 4 专家中缺失的一半（100MB）、只算路由到的专家——
+**用 2.4s/step 的 a2a 流量换掉 8× 冗余专家计算与 ~60GB/step 的 AG**。
 
-### 2.3 专家切分与 EP/efsdp mesh（实测更正版，E2 rank0）
+### 2.3 专家切分与 EP/efsdp mesh（2026-11-03 更正版：修正 2.3 旧版"efsdp 复制轴"错误结论）
 
-模型维度（GMM 实测反推）：D=4096，moe_intermediate F=2048，16 专家，ep=4，efsdp=2；
-8 卡展平 **rank = efsdp×4 + ep**（efsdp 对 = {0,4}/{1,5}/{2,6}/{3,7}，由 2 卡集合通信配对实测确认）。
+> **更正声明**：本节旧版（"E2 rank0 实测更正版"）结论"**E 维只被 ep 切、efsdp 是组间复制轴、
+> 专家权重无 AG/梯度无 RS、每 rank 4 完整专家**"是**错误**的。旧证据方法论有缺陷：
+> ① GMM 输入 shape (4,2048,4096) 是 **FSDP unshard 之后**的形状，对 efsdp 是否切分不敏感；
+> ② 旧的跨 rank 配对检查（"0 of 178"）没有按 HCCL 组分组配对，漏检了 efsdp 组。
+> 本版以代码 + 重新配对的实测为准。
 
-**计算布局（GMM 实测 shape 为准）**：
+**代码依据**（eager 与 spmd 两路径同款逻辑）：
 
-| 参数 | 全局 shape | 切分后每 rank | 证据 |
+- `torchtitan/distributed/fsdp.py:226-233`（eager）：`efsdp_ep_size = efsdp×ep`，
+  `> num_experts` 时专家用 `Shard(1)`（切 FFN/hidden 维），否则 `Shard(0)`（切专家维）。
+- `experiments/graph_trainer/common_utils.py:410`（spmd/GraphTrainer）：
+  `inner_experts` 单独在 efsdp 网格上 data_parallel，同一饱和判据的 `shard_dim=1` 回退；
+  复合 placement 由 `simple_fsdp.py:48 _distribute_dtensor` 合成（inner=EP、outer=fsdp）。
+- `parallel_dims.py:279`：`efsdp = fsdp × tp / ep`（fsdp 维被 ep 分掉一半）。
+
+**E2 配置的判定**（16 专家、ep=4、efsdp=2）：`efsdp_ep_size = 2×4 = 8 ≤ 16` →
+**Shard(0)，专家权重沿 E 维被 (ep×efsdp)=8 路切分，每 rank 驻留 2 个专家的份额**。
+
+**实测证据**（E2 rank0 op_summary，按 HCCL 组重新配对，2026-11-03）：
+
+| HCCL 组 | 构成 | AG | RS | 跨 rank 配对 |
+|---|---|---|---|---|
+| group 254 | **efsdp 对（2 卡）= 专家权重 FSDP** | **86 = 43 层×2**（前向 unshard + 反向重取） | **43 = 43 层×1**（专家梯度 RS） | rank0 的 AG 85/86 与 rank4 配对、与 rank1 为 **0** → 对 = {0,4}/{1,5}/{2,6}/{3,7} |
+| group 612 | dense 组（全 8 卡） | 92 | 47（+AR 7、A2A 88） | rank0 与 rank1 匹配 89/92 → 全 8 卡组 |
+
+efsdp 对内 AG payload ≈ 本地专家权重一半（Shard(0) 下 = 2 专家份额 ≈ 100MB/层，
+w1/w2/w3 各 (2,2048,4096) bf16）——与旧版记录的"AG ~3-6ms、RS ~19-25ms、busy 0.03s/0.10s"
+一致，**归属是专家权重 FSDP 的 unshard/梯度 RS，不是旧版所说的"优化器状态再同步"**。
+
+**计算布局（每 rank 驻留）**：
+
+| 参数 | 全局 shape | 每 rank 驻留 | 说明 |
 |---|---|---|---|
-| routed w1/w3 (E,F,D) | (16, 2048, 4096) | **(4, 2048, 4096)** | GMM 258 次 |
-| routed w2 (E,D,F) | (16, 4096, 2048) | **(4, 4096, 2048)** | GMM 129 次（43层×3相位） |
-| dense（attention 等 2D 权重） | 如 (2048, 4096) | (256, 4096)（FSDP2 切 dim0，8 卡） | 97× 8 卡 AG |
-| shared expert + gate | 3×(2048,4096) ≈ 50MB | (512,4096)×3（ep 组 4 卡切） | 38× 4 卡 AG，payload≈47MB |
+| routed w1/w2/w3 | 3×(16, 2048/4096, …) | **2 专家当量**（8 路切 E） | GMM 看到的 (4,…) 是 efsdp unshard 后的 EP-local 形状 |
+| dense（attention/shared expert/gate） | — | 8 路切 dim0 | 8 卡 AG；shared+gate AG payload ≈44-47MB 与 8 路切分吻合（4 路预测 37.5MB，实测更支持 8 路） |
 
-要点：
-- **E 维只被 ep 切（4 路）**：每 rank 独占 4 个**完整**专家（F/D 全维在位）⇒ 前向/反向
-  **专家权重无 AG、梯度无 RS**（对比 dense FSDP 每层要 AG 重建完整参数）。
-- **efsdp 轴不切 compute 权重的任何一维**（hidden D=4096、F=2048 全维在位；若切 hidden
-  GMM 应为 (4,1024,4096)，实测否定）。efsdp 是 **EP 组间复制轴（HSDP 式）**：8 个 DP rank
-  分成 2 个独立 EP 组（{0-3} 与 {4-7}），**各组持有全部 16 专家（4 完整专家/rank），服务组内
-  4 个 rank 的 token**（a2a 组局域性实测：rank0 的 a2a 与 rank1 重叠 200/200、与 rank4 仅
-  85/200 为墙钟巧合）——两组处理不同数据，计算零冗余。
-- **efsdp 的作用在优化器状态**：状态按 ('ep','efsdp') 8 路切 E（2 专家状态/rank，fp32 状态
-  减半）；组间对（{0,4} 等）承担跨组梯度均值与权重/状态再同步——**实测每 step 数次、
-  时间戳散布在反向后段（grad-norm AR 之前，即优化器更新之前）**，RS ~19-25ms、AG ~3-6ms，
-  且 AG→RS 常相邻成对（疑似重分片的 gather/scatter 对，AG 的确切语义未定位）。
-  专家数 < ep×efsdp 时该布局有 Shard(1)/BlockShard 兜底（`fsdp.py:180` eager 路径同款逻辑）。
-- **可扩展性**：E 只需被 ep 切（≤256 路），多出的卡全部充当组间副本——
-  1024 卡 = ep256 × efsdp4（每 rank 1 个完整专家 + 4 组副本）完全成立，
-  不存在"专家不够切"的问题。
-- **sparse 4 卡 AG 是预取**（shared expert/gate）：在 attention 期间发出，完成于 router
-  前（AG 结束→下一个 TopkV2 中位间隔 3.79ms，min 0.04ms），94% 被 attention 掩盖；
-  若"用到才发"则 +14ms×43层 全暴露。
-- **MoE 层参数的三种待遇**：dense 部分（attention 块）8 卡 FSDP（8 卡 AG）；shared
-  expert+gate（~50MB，payload 实测吻合）在 EP 组 4 卡 mesh 上切（EP 轴 4 份，组内 AG，
-  efsdp 轴复制，随 sparse 域一起组间同步）；routed experts EP 驻留无 AG。
-- **与 MindSpeed-LLM 的 efsdp 同名不同义**：MindSpeed fsdp2 路径（`expert_fully_shard_parallel.py`）
-  的 efsdp 是**真·专家 FSDP**——`fully_shard(expert, mesh=(ep, ep_fsdp))`，默认
-  `Shard(1)`（切 F 维，可配 'shard_by_dim_0'），权重真切、用前 AG；本仓库 v4 spmd
-  路径的 efsdp 是组间复制轴（计算权重不切，优化器状态切）。本仓库 eager 路径
-  （`fsdp.py:174-183`）与 MindSpeed 同款（efsdp×ep 在 dim0 切，efsdp_ep_size >
-  num_experts 时降 Shard(1)）。
+**要点（替代旧版）**：
 
-按参与集合分类的通信（union 口径，8 卡平均，busy/掩盖率）：
+- 专家权重**与 dense 参数一样走 FSDP**：每层前向 1 次 efsdp AG（预取，被掩盖好）、
+  反向重取 1 次 AG + 1 次 RS；efsdP 对内通信每 step 仅 ~0.13s busy，**被掩盖良好**。
+- 饱和规则：`efsdp×ep > num_experts` 时自动从切专家维降级为切 FFN/hidden 维
+  （两路径都有此回退）；MindSpeed fsdp2 的 `shard_placement_fn` **默认 Shard(1)**
+  （无条件切 F/hidden 维，可配 shard_by_dim_0），与本仓库"默认 dim0、饱和才 dim1"相反——
+  正常非饱和 regime 两者每 rank 字节数相同（同为 T/分片度），差别在通信与负载均衡
+  （MindSpeed 每 expert FFN 需 efsdp 组内 AG/RS、负载天然均衡；本仓库整 expert 局部计算、
+  热 expert 有倾斜风险）。
+- **EP 的真实收益**不是"专家驻留零 AG"（EP=4 下仍有 8.6GB/step 的 efsdp AG），而是：
+  ① ep=1 时每 rank GMM 要算全部 16 专家（8× 冗余计算）且 module 级 unshard 需 AG 全量
+  805MB/层（≈69GB/step）；EP=4 后只算路由到的 4 个本地专家、AG 降到 100MB/层。
+  ② 内存两种布局相同（都 ≈2 专家/rank）。
+- efsdp 对的 mesh 展平为 efsdp-major（rank = efsdp×4 + ep，对 = {0,4} 型）；
+  MindSpeed 为 ep-major（连续对 {0,1} 型）——配对方式不同，语义相同。
+
+按参与集合分类的通信（union 口径，8 卡平均，busy/掩盖率；**归因已按本节更正**）：
 
 | 类别 | AG | RS | a2a |
 |---|---|---|---|
-| 8 卡（dense FSDP） | 0.52s / 63%* | 0.58s / 54%* | —（分类噪音） |
-| 4 卡 ep 组（sparse FSDP / dispatch+combine） | 0.59s / **94%*** | 0.30s / 80%* | ~2.4s / **11%*** |
-| 2 卡 efsdp 对 | 0.03s / 77%* | 0.10s / 38%* | — |
+| 8 卡（dense FSDP：attention/shared/gate） | 0.52s / 63%* | 0.58s / 54%* | —（分类噪音） |
+| 4 卡 ep 组（dispatch+combine） | — | — | ~2.4s / **11%*** |
+| 2 卡 efsdp 对（**专家权重 FSDP**） | 0.03s / 77%* | 0.10s / 38%* | — |
 
-*带星号为 rank0 数值；8 卡平均见 §4.2。**efsdp 对内通信每 step 仅 ~25ms**，
-MoE 段的暴露通信几乎全部来自 a2a（EP token 移动）。
+*带星号为 rank0 数值；8 卡平均见 §4.2。efsdp 对内通信每 step 仅 ~25ms 且 AG 预取掩盖好，
+MoE 段的暴露通信几乎全部来自 a2a（EP token 移动）——该总括结论不变。
 
 ---
 
