@@ -33,6 +33,7 @@ calibrated constants.
 
 from collections.abc import Callable
 from dataclasses import dataclass
+from inspect import signature
 
 from torchtitan_simulator.capture.tensor_utils import tensor_volume_bytes
 from torchtitan_simulator.ir.op_node import OpNode
@@ -114,7 +115,7 @@ def _library_matmul_duration(name: str, inputs: list[TensorMeta], outputs: list[
             outputs=tuple(TensorFeatures(shape=t.shape, dtype=t.dtype, device=t.device) for t in outputs),
         )
         parsed = MatmulAdaptor().parse(features)
-        estimate = MatmulRoofline(overhead_us=_OVERHEAD_US).predict(parsed, hardware)
+        estimate = MatmulRoofline(_OVERHEAD_US, semantics=parsed, hardware=hardware).predict()
         return estimate.duration_us
     except Exception:
         return None
@@ -282,6 +283,166 @@ _GDN_VALUE_BLOCK = 16
 _GDN_AIV_CORES = 20
 
 
+def _sla2_families() -> dict:
+    """Import-guarded adaptor/model table for the four SLA2 library families.
+
+    The structural formulas (cube GEMM populations, declared softmax/normalize
+    vector units) live in ``operator-performance-models`` (see its
+    ``docs/sla2-roofline-models.md``); this adapter only translates captured
+    tensor facts and the ``selected_blocks`` schema scalar.
+    """
+    from operator_performance_models.adaptors.npu_fused import (
+        Sla2LinearAttentionAdaptor,
+        Sla2SparseAttentionAdaptor,
+    )
+    from operator_performance_models.adaptors.npu_gradients import (
+        Sla2LinearAttentionGradientAdaptor,
+        Sla2SparseAttentionGradientAdaptor,
+    )
+    from operator_performance_models.models.roofline.fused import (
+        Sla2LinearAttentionGradientRoofline,
+        Sla2LinearAttentionRoofline,
+        Sla2SparseAttentionGradientRoofline,
+        Sla2SparseAttentionRoofline,
+    )
+
+    return {
+        "sla2_sparse_attention": (
+            "Sla2SparseAttention",
+            "multi_head_moe_sim.sla2_sparse_attention.default",
+            Sla2SparseAttentionAdaptor(),
+            Sla2SparseAttentionRoofline,
+        ),
+        "sla2_sparse_attention_gradient": (
+            "Sla2SparseAttentionBackward",
+            "multi_head_moe_sim.sla2_sparse_attention_grad.default",
+            Sla2SparseAttentionGradientAdaptor(),
+            Sla2SparseAttentionGradientRoofline,
+        ),
+        "sla2_linear_attention": (
+            "Sla2LinearAttention",
+            "multi_head_moe_sim.sla2_linear_attention.default",
+            Sla2LinearAttentionAdaptor(),
+            Sla2LinearAttentionRoofline,
+        ),
+        "sla2_linear_attention_gradient": (
+            "Sla2LinearAttentionBackward",
+            "multi_head_moe_sim.sla2_linear_attention_grad.default",
+            Sla2LinearAttentionGradientAdaptor(),
+            Sla2LinearAttentionGradientRoofline,
+        ),
+    }
+
+
+# Declared vector configuration for the SLA2 fusions: equivalent_ops 1.0 means
+# the library's structural unit counts are taken literally, and FP32 compute
+# matches the debug model's FP32 parameters. Explicitly declared, not
+# calibrated; a consumer may override by extending the cost layer.
+_SLA2_VEC_CONFIG_KWARGS = {"compute_bits": 32, "equivalent_ops": 1.0, "compute_dtype": "float32"}
+
+# Captured TensorMeta shorthand -> the library's canonical dtype names; the
+# shared npu adaptor helpers only accept the canonical spellings.
+_DTYPE_ALIASES = {
+    "bf16": "bfloat16",
+    "fp16": "float16",
+    "f16": "float16",
+    "fp32": "float32",
+    "f32": "float32",
+    "fp64": "float64",
+    "f64": "float64",
+}
+
+
+def _canonical_dtype(dtype: str) -> str:
+    return _DTYPE_ALIASES.get(dtype, dtype)
+
+
+def _sla2_library_cost(
+    op_type: str,
+    inputs: list[TensorMeta],
+    outputs: list[TensorMeta],
+    hardware,
+    attrs: dict | None,
+) -> CostEstimate:
+    """Route an SLA2 fusion to its ``operator-performance-models`` roofline model.
+
+    The library roofline requires chip capabilities, so without a hardware
+    profile the nodes stay ``cost_unknown`` rather than partially annotated;
+    with one, the estimate carries cube+vec work, logical traffic and a
+    duration from the declared coarse policy.
+    """
+    if hardware is None or hardware.chip is None:
+        return CostEstimate.unknown_cost()
+    selected = (attrs or {}).get("selected_blocks")
+    if type(selected) is not int:
+        return CostEstimate.unknown_cost()
+    try:
+        from operator_performance_models.core import OpFeatures, TensorFeatures
+        from operator_performance_models.roofline_config import VecOpConfig
+
+        canonical, raw_name, adaptor, model = _sla2_families()[op_type]
+        features = OpFeatures(
+            raw_name=raw_name,
+            name=canonical,
+            inputs=tuple(
+                TensorFeatures(shape=t.shape, dtype=_canonical_dtype(t.dtype), device=t.device)
+                for t in inputs
+            ),
+            outputs=tuple(
+                TensorFeatures(shape=t.shape, dtype=_canonical_dtype(t.dtype), device=t.device)
+                for t in outputs
+            ),
+            attributes=(("selected_blocks", selected),),
+        )
+        parsed = adaptor.parse(features)
+        estimate = model(
+            _OVERHEAD_US,
+            VecOpConfig(**_SLA2_VEC_CONFIG_KWARGS),
+            semantics=parsed,
+            hardware=hardware,
+        ).predict()
+        details = estimate.details
+        if details is None:
+            return CostEstimate.unknown_cost()
+        flops = (details.cube_flops or 0) + (details.vec_flops or 0)
+        traffic = (details.read_bytes or 0) + (details.write_bytes or 0)
+        return CostEstimate(flops=flops, traffic_bytes=traffic, duration_us=estimate.duration_us)
+    except Exception:
+        return CostEstimate.unknown_cost()
+
+
+def _sla2_sparse_attention_cost(
+    inputs: list[TensorMeta],
+    outputs: list[TensorMeta],
+    hardware=None,
+    attrs: dict | None = None,
+) -> CostEstimate:
+    """``multi_head_moe_sim.sla2_sparse_attention`` (+ grad) via the library model."""
+    return _sla2_library_cost(
+        "sla2_sparse_attention" if len(outputs) == 1 else "sla2_sparse_attention_gradient",
+        inputs,
+        outputs,
+        hardware,
+        attrs,
+    )
+
+
+def _sla2_linear_attention_cost(
+    inputs: list[TensorMeta],
+    outputs: list[TensorMeta],
+    hardware=None,
+    attrs: dict | None = None,
+) -> CostEstimate:
+    """``multi_head_moe_sim.sla2_linear_attention`` (+ grad) via the library model."""
+    return _sla2_library_cost(
+        "sla2_linear_attention" if len(outputs) == 1 else "sla2_linear_attention_gradient",
+        inputs,
+        outputs,
+        hardware,
+        attrs,
+    )
+
+
 def _gdn_cost(inputs: list[TensorMeta], outputs: list[TensorMeta], hardware=None) -> CostEstimate:
     """``qwen3_5_sim.gated_delta_rule``: forward (1 output) and backward (5).
 
@@ -342,7 +503,22 @@ def _make_mhc_handler(backward: bool):
     return handler
 
 
-_HANDLERS: dict[str, Callable[[list[TensorMeta], list[TensorMeta], object], CostEstimate]] = {
+# Handlers take (inputs, outputs, hardware) and optionally attrs; runtime
+# dispatch checks the signature, so the wide Callable keeps both arities.
+def _communication_cost(
+    inputs: list[TensorMeta], outputs: list[TensorMeta], hardware=None
+) -> CostEstimate:
+    """``all_to_all`` / ``reduce_scatter``: logical cross-rank volume, no link model.
+
+    Each logical input leaves the rank once and each output arrives once, so
+    the collectives' bytes are in+out at dtype widths.  Duration needs a
+    communication link model (``CollectiveRooflineConfig`` + topology), which
+    the current workloads do not consume; nodes carry bytes without a duration.
+    """
+    return CostEstimate(comm_bytes=_traffic([*inputs, *outputs]))
+
+
+_HANDLERS: dict[str, Callable[..., CostEstimate]] = {
     # Dispatch nodes carry the normalized ``op_type`` ("matmul") alongside the
     # raw ``aten.mm.default`` annotation; the registry keys on the former.
     "matmul": _matmul_cost,
@@ -364,6 +540,14 @@ _HANDLERS: dict[str, Callable[[list[TensorMeta], list[TensorMeta], object], Cost
     # Latency-bound sequential-scan kernel: duration from the declared
     # per-token latency model (see _gdn_cost), not a roofline leg.
     "gated_delta_rule": _gdn_cost,
+    # SLA2 branch fusions (multi_head_moe): modeled entirely by the
+    # operator-performance-models package (fwd/grad families); needs chip
+    # capabilities, so nodes stay cost_unknown without a hardware profile.
+    "sla2_sparse_attention": _sla2_sparse_attention_cost,
+    "sla2_linear_attention": _sla2_linear_attention_cost,
+    # Collectives: logical cross-rank volume only; duration awaits a link model.
+    "all_to_all": _communication_cost,
+    "reduce_scatter": _communication_cost,
 }
 
 # Unknown dispatch nodes fall back to their raw op name (``aten.*`` / ``npu.*``
@@ -459,22 +643,35 @@ def _raw_cost(raw: str, inputs: list[TensorMeta], outputs: list[TensorMeta], har
     return None
 
 
+def _accepts_attrs(handler: Callable) -> bool:
+    """SLA2-style handlers take the captured node attributes as a 4th argument."""
+    try:
+        return len(signature(handler).parameters) == 4
+    except (TypeError, ValueError):  # pragma: no cover - builtins
+        return False
+
+
 def compute_cost(
     op_type: str,
     inputs: list[TensorMeta],
     outputs: list[TensorMeta],
     hardware=None,
     raw_op_type: str | None = None,
+    attrs: dict | None = None,
 ) -> CostEstimate:
     """Look up the handler for one dispatch op; unknown ops stay unknown.
 
     Passing a hardware profile additionally asks handlers for a duration
     prediction; the default ``None`` keeps every call hardware-independent.
     Nodes dispatching as ``unknown`` fall back to their ``raw_op_type``.
+    Handlers that declare an ``attrs`` parameter receive the captured node
+    attributes (schema scalars of virtual fusions).
     """
     handler = _HANDLERS.get(op_type)
     if handler is not None:
         try:
+            if _accepts_attrs(handler):
+                return handler(inputs, outputs, hardware, attrs or {})
             return handler(inputs, outputs, hardware)
         except (IndexError, TypeError, ValueError):
             return CostEstimate.unknown_cost()
@@ -489,8 +686,20 @@ def compute_cost(
 
 
 def _annotate_node(node: OpNode, hardware) -> None:
-    cost = compute_cost(node.op_type, node.inputs, node.outputs, hardware, node.annotations.get("raw_op_type"))
-    if cost.unknown or (not cost.flops and not cost.traffic_bytes and cost.duration_us is None):
+    cost = compute_cost(
+        node.op_type,
+        node.inputs,
+        node.outputs,
+        hardware,
+        node.annotations.get("raw_op_type"),
+        attrs=node.attrs,
+    )
+    if cost.unknown or (
+        not cost.flops
+        and not cost.traffic_bytes
+        and not cost.comm_bytes
+        and cost.duration_us is None
+    ):
         node.annotations[_UNKNOWN_KEY] = True
         return
     if cost.flops:

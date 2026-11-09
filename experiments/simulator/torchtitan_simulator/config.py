@@ -153,6 +153,14 @@ _QWEN3_5_OVERRIDES = [
     "torchtitan_npu.override.qwen3_5.gated_delta.npu",
 ]
 
+# SLA2 uses the fused interleave RoPE like the DSV4 families; the rms_norm and
+# ASC MoE dispatcher entries reuse the shared common overrides. The SLA2 branch
+# fusions are installed by runtime.configure_model, not through override.imports.
+_MULTI_HEAD_MOE_OVERRIDES = [
+    *_COMMON_OVERRIDES,
+    "torchtitan_npu.override.common.rope.asc_complex",
+]
+
 # The production A3 text recipe (examples/deepseek_v4_1) enables rms_norm, the
 # ASC MoE dispatcher and the V4.1 MHC post-processing override; the CLI rope
 # default (asc_complex) applies after the ops list and wins over
@@ -181,6 +189,7 @@ def prepare_config(simulation: SimulationConfig) -> PreparedConfig:
         "qwen3_5_debugmodel_moe": "torchtitan_simulator.presets.qwen3_5_debugmodel_moe",
         "deepseek_v4_1_debugmodel_text": "torchtitan_simulator.presets.deepseek_v4_1_debugmodel_text",
         "deepseek_v4_1_debugmodel_multimodal": "torchtitan_simulator.presets.deepseek_v4_1_debugmodel_multimodal",
+        "multi_head_moe_debugmodel": "torchtitan_simulator.presets.multi_head_moe_debugmodel",
     }
     target = factories.get(simulation.config, simulation.config)
     if "." not in target:
@@ -205,8 +214,8 @@ def prepare_config(simulation: SimulationConfig) -> PreparedConfig:
         if value is not None:
             setattr(trainer.training, target_name, value)
     model = trainer.model_spec.model
-    if trainer.model_spec.name not in {"deepseek_v4", "deepseek_v4_1", "kimi_k3", "qwen3_5"}:
-        raise ValueError("Supported model families are deepseek_v4, deepseek_v4_1, kimi_k3 and qwen3_5")
+    if trainer.model_spec.name not in {"deepseek_v4", "deepseek_v4_1", "kimi_k3", "qwen3_5", "multi_head_moe"}:
+        raise ValueError("Supported model families are deepseek_v4, deepseek_v4_1, kimi_k3, qwen3_5 and multi_head_moe")
     adaptations = []
     if simulation.model_overrides is not None:
         adaptations.append("typed geometry overrides rebuilt the complete native model configuration tree")
@@ -251,6 +260,7 @@ def prepare_config(simulation: SimulationConfig) -> PreparedConfig:
                 "deepseek_v4_1": _DSV4_1_OVERRIDES,
                 "kimi_k3": _COMMON_OVERRIDES,
                 "qwen3_5": _QWEN3_5_OVERRIDES,
+                "multi_head_moe": _MULTI_HEAD_MOE_OVERRIDES,
             }[trainer.model_spec.name]
         )
         if simulation.override_imports is None

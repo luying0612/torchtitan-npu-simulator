@@ -72,7 +72,7 @@ Two fused families step outside the roofline path:
 
 from __future__ import annotations
 
-__all__ = ["npu_910b3"]
+__all__ = ["dv120_hardware", "npu_910b3"]
 
 _CUBE_LOG_UTILIZATION = (0.1056, -1.8626, 0.0404, 0.9254)
 
@@ -116,3 +116,68 @@ def _profile():
 def npu_910b3():
     """The calibrated 910B3 profile for duration prediction."""
     return _profile()
+
+
+_DV120_CHIP = "/workspace/hardware/dv120-chip.txt"
+
+
+def _dv120_utilization(spec: dict):
+    """DV120 utilization record -> the library's immutable utilization model."""
+    from operator_performance_models.hardware import ConstantUtilization, LogUtilization
+
+    if "constant" in spec:
+        return ConstantUtilization(ratio=float(spec["constant"]))
+    return LogUtilization(
+        k=float(spec["log_a"]),
+        b=float(spec["log_b"]),
+        min_ratio=float(spec["min_ratio"]),
+        max_ratio=float(spec["max_ratio"]),
+    )
+
+
+def dv120_hardware(path=_DV120_CHIP):
+    """Real DV120 profile parsed from the platform hardware file (no calibration added).
+
+    Maps the DV120 JSON onto ``operator-performance-models`` chip capabilities:
+    compute peaks in TFLOPS keyed by ``floatN`` storage width, per-unit
+    log/constant utilization models, HBM size/bandwidth and the two head-tail
+    constants.  The companion topology file and the L2 cache record are not
+    consumed by the compute roofline path.
+    """
+    import json
+    from pathlib import Path
+
+    from operator_performance_models.core import Hardware
+    from operator_performance_models.hardware import (
+        ChipCapabilities,
+        ComputeCapability,
+        HbmCapability,
+    )
+
+    data = json.loads(Path(path).read_text())
+    compute, memory, utilization = data["compute"], data["memory"], data["utilization"]
+
+    def capability(section: str) -> ComputeCapability:
+        entries = tuple(
+            (int(bits.removeprefix("float")), float(value))
+            for bits, value in sorted(
+                compute[section].items(), key=lambda kv: int(kv[0].removeprefix("float"))
+            )
+        )
+        return ComputeCapability(
+            tflops_by_bits=entries, utilization=_dv120_utilization(utilization[section])
+        )
+
+    hbm = memory["hbm"]
+    chip = ChipCapabilities(
+        cube=capability("cube"),
+        vec=capability("vector"),
+        hbm=HbmCapability(
+            capacity_gb=float(hbm["size"]),
+            bandwidth_tb_per_second=float(hbm["bandwidth"]),
+            utilization=_dv120_utilization(utilization["hbm"]),
+        ),
+        head_tail_time=float(data["head_tail_time"]),
+        head_tail_time_for_fused_op=float(data["head_tail_time_for_fused_op"]),
+    )
+    return Hardware(name=Path(path).stem, chip=chip)

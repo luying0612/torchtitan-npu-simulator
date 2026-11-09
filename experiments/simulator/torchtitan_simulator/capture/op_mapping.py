@@ -56,6 +56,10 @@ OP_MAPPING: dict[str, str] = {
     "kimi_sim.chunk_kda_grad.default": "chunk_kda",
     "qwen3_5_sim.gated_delta_rule.default": "gated_delta_rule",
     "qwen3_5_sim.gated_delta_rule_grad.default": "gated_delta_rule",
+    "multi_head_moe_sim.sla2_sparse_attention.default": "sla2_sparse_attention",
+    "multi_head_moe_sim.sla2_sparse_attention_grad.default": "sla2_sparse_attention",
+    "multi_head_moe_sim.sla2_linear_attention.default": "sla2_linear_attention",
+    "multi_head_moe_sim.sla2_linear_attention_grad.default": "sla2_linear_attention",
     "situ_glu_backward": "situ_glu",
     "npu.npu_rotary_mul.default": "rope",
     # MoE dispatch
