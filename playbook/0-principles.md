@@ -24,19 +24,22 @@
 | 4 自验证与审视 | 验证矩阵全绿 + 审视意见闭环 | 测试矩阵 + 修改记录 |
 | 5 端到端与实测对比 | sim-platform 跑通 + 真机算子差异报告 | L1 导出 + kernel CSV + 对比报告 |
 
-## 权威文档指针（本 playbook 与各仓规则的关系）
+## 权威文档指引（各阶段对应的仓内规则）
 
-- 本 playbook 面向 **titan030（0.3.0 新仿真栈）**，是实操补充；**仓内权威规则以仓库文档为准**：
-  - 接入规则：`experiments/simulator/docs/model-integration.md`（+ 同目录 `model-integration-pitfalls.md`）
-  - 仓库纪律：`experiments/simulator/AGENTS.md`（Meta 捕获边界、内存/语义纪律）
-  - 能力边界：`experiments/simulator/docs/capability-matrix.md`
-- **旧栈（0.2.x，titan-qwen3.5 时代）**的权威文档与 0.3.0 结构不同（ModelSpec / hardware_shims
-  那套），不适用于本流程；适配旧栈模型时改用它们，路径留档备查：
-  - 操作手册：`/home/l30079348/titan-qwen3.5/torchtitan_training_modeling_guide.md`
-  - 接入规则：`titan-qwen3.5/docs/feature_guides/new_model_onboarding.md`
-  - 最终验收：`titan-qwen3.5/docs/test_guides/model_acceptance.md`（"模拟器建模可用"判据：
-    声明特性全过 + 参数切分/核心算子/通信/显存有独立预期值且与实测一致 + meta 验证结构/shape/
-    autograd/依赖/资源 + 不支持模式 fail fast）
+新栈（titan030）的接入规则与最终验收**在 simulator 仓内**；本 playbook 是实操补充。
+每阶段动手前先读对应章节，验收以仓内判据为准（文档位于仓 `experiments/simulator/`）：
+
+| 阶段 | 权威文档 | 对齐内容 |
+| --- | --- | --- |
+| 0 总纲 | `AGENTS.md` | 阅读顺序、修改归属、必须保持的边界（原生 dispatch 优先、虚拟融合四契约、稳态捕获、FSDP 通信视图、内存去重/offload 规则）、验证与文档纪律 |
+| 1 迁移 | `docs/model-integration.md` §1–§5 | 固定环境与模型依据、**先选复用路线**（§2）、配置树/ModelSpec/接入检查清单（§3.3）、算子先原生后必要兼容（§4）、并行按顺序使能（§5） |
+| 2 缺失验证 | `AGENTS.md` 边界节 + `docs/custom-tensor-semantics.md` | 按 schema 与最小 Meta/梯度探针判断兼容缺口（不按版本号装 patch）、语义声明契约 |
+| 4 验收 | `docs/model-integration.md` §6–§7 | **验收关卡 A–F**：A 配置与构建 / B 核心组件 / C 单任务 F/B/O / D 并行与 AC / E 内存与卸载 / F 量化与交付；独立预期值对账、拒绝组合要有测试、**不用 build-only/测试数量/Meta 成功替代验收**；§7 交接项清单 |
+| 5 端到端 | `AGENTS.md`（性能预测归下游）+ `docs/capability-matrix.md` | cost/DES/最终指标归下游平台（sim-platform），不在训练仓恢复；能力边界以矩阵为准 |
+
+专题文档按需读：`model-integration-pitfalls.md`（常见问题）、`capture-runtime.md`、
+`steady-state-capture.md` / `steady-state-memory.md`、`activation-offload-design.md` /
+`optimizer-offload.md`、`developer-guide.md`、`upstream-integration.md`。
 
 ## 环境速查（通用）
 

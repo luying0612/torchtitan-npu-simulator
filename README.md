@@ -6,8 +6,8 @@
 ## 使用方式（新模型适配时）
 
 1. 读 `playbook/0-principles.md`（铁律 + 流程总览 + 环境）。
-   **权威文档指针**也在该文件：0.3.0 仓内规则（model-integration/AGENTS/capability-matrix）
-   与旧栈（0.2.x titan-qwen3.5）手册及其接入规则/验收文档的路径。
+   **权威文档指引**也在该文件：各阶段对应的仓内规则——接入流程 `model-integration.md` §1–§5、
+   验收关卡 §6（A–F）、仓库边界 `AGENTS.md`、能力矩阵 `capability-matrix.md`。
 2. 按顺序执行五阶段，每阶段对照对应 playbook 文档的 checklist：
    `1-migrate`（迁移模型代码到仿真仓库）→ `2-capture-completeness`（验证算子缺失/未捕获）→
    `3-op-modeling`（补充算子建模，**优先复用算子建模仓已有逻辑，实在没有才新写**）→

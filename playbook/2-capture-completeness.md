@@ -1,5 +1,7 @@
 # 2 · 验证是否有算子缺失没有捕获
 
+> **仓内权威规则：`AGENTS.md`"必须保持的边界"节（原生 dispatch 优先、按 schema 与最小
+> Meta/梯度探针判断缺口、语义契约）+ `docs/custom-tensor-semantics.md`**。
 > 目标：证明 **Meta 捕获图 = 真实执行同一代码的算子集合**（在声明的 override/虚拟化边界内）。
 > 样例：`case-multi-head-moe/04-self-verification.md`（CPU dispatch 对照节）。
 

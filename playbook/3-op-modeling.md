@@ -1,7 +1,9 @@
 # 3 · 补充算子建模（优先复用算子建模仓已有逻辑）
 
-> 样例：`case-multi-head-moe/03-op-modeling.md`。**正本仓库**：`/home/l30079348/opm-dev`
-> （operator-performance-models，远端 `ZhanluModelSim/operator-performance-models`）。
+> **仓内权威规则：`AGENTS.md`"修改归属"节——性能预测、硬件、cube/vec 分类、DES 与最终指标归下游，
+> 不在训练仓恢复 cost 或编造耗时**（simulator 侧只做库路由）。建模正本仓：
+> `/home/l30079348/opm-dev`（operator-performance-models，远端 ZhanluModelSim/operator-performance-models）。
+> 样例：`case-multi-head-moe/03-op-modeling.md`。
 
 ## 3.1 复用优先：三步查询
 

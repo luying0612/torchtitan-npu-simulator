@@ -1,5 +1,8 @@
 # 5 · 端到端运行并与实测对比
 
+> **仓内权威规则：`AGENTS.md`（性能预测/DES/最终指标归下游平台，不在训练仓恢复）+
+> `docs/capability-matrix.md`（能力边界）**；sidecar 回归与类型检查入口
+> `bash scripts/validate.sh`（model-integration.md §7）。
 > 样例：`case-multi-head-moe/06-sim-vs-real-diff.md` + `archive/mhoe-real-bench-REPORT.md`（对比报告模板）。
 
 ## 5.1 sim-platform 端到端（原 simulator 无端到端耗时）

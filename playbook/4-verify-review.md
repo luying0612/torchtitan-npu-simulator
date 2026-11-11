@@ -1,6 +1,15 @@
 # 4 · 自我验证与审视并修改
 
+> **仓内权威规则：`docs/model-integration.md` §6 验收关卡 A–F + §7 交接要求；`AGENTS.md`
+> 验证纪律（分阶段出口验收，不用 build-only/测试数量/Meta 成功替代数值证明）**。
 > 样例：`case-multi-head-moe/04-self-verification.md`（验证矩阵）、`05-review-revisions.md`（逐轮过程）。
+
+## 4.0 与仓内验收关卡的对应
+
+本矩阵（下表）是 model-integration.md §6 关卡 A–F 的实操展开：§4.1 行 1 ≈ 关卡 A（配置与构建）+
+关卡 C/D（F/B/O、并行与 AC）；行 3 ≈ 关卡 B（核心组件对照）；行 4/5 ≈ 关卡 E（内存与卸载、
+独立预期值对账）；行 6 ≈ 各关的独立预期要求。**每关须在新模型的真实入口上验证**；支持的最小组合 =
+world=1 + FSDP/HSDP + 适用 TP/EP/CP + 首末 rank + AC 三种模式（不做机械笛卡尔积）。
 
 ## 4.1 自验证矩阵（全绿才算交付）
 

@@ -1,8 +1,9 @@
 # 1 · 迁移模型代码到仿真仓库
 
+> **仓内权威规则：`experiments/simulator/docs/model-integration.md` §1–§5（先读它，本文是实操补充）**。
 > AI 可执行细节：`skills/titan030-sim-model-adapt/SKILL.md`。样例：`case-multi-head-moe/02-model-migration.md`。
 
-## 1.1 判定模型来源（决定工作量）
+## 1.1 判定模型来源与复用路线（对齐 model-integration.md §2"先选复用路线再确定文件"）
 
 | 来源 | 需要做什么 |
 | --- | --- |
