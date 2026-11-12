@@ -385,12 +385,10 @@ def _sla2_library_cost(
             raw_name=raw_name,
             name=canonical,
             inputs=tuple(
-                TensorFeatures(shape=t.shape, dtype=_canonical_dtype(t.dtype), device=t.device)
-                for t in inputs
+                TensorFeatures(shape=t.shape, dtype=_canonical_dtype(t.dtype), device=t.device) for t in inputs
             ),
             outputs=tuple(
-                TensorFeatures(shape=t.shape, dtype=_canonical_dtype(t.dtype), device=t.device)
-                for t in outputs
+                TensorFeatures(shape=t.shape, dtype=_canonical_dtype(t.dtype), device=t.device) for t in outputs
             ),
             attributes=(("selected_blocks", selected),),
         )
@@ -505,9 +503,7 @@ def _make_mhc_handler(backward: bool):
 
 # Handlers take (inputs, outputs, hardware) and optionally attrs; runtime
 # dispatch checks the signature, so the wide Callable keeps both arities.
-def _communication_cost(
-    inputs: list[TensorMeta], outputs: list[TensorMeta], hardware=None
-) -> CostEstimate:
+def _communication_cost(inputs: list[TensorMeta], outputs: list[TensorMeta], hardware=None) -> CostEstimate:
     """``all_to_all`` / ``reduce_scatter``: logical cross-rank volume, no link model.
 
     Each logical input leaves the rank once and each output arrives once, so
@@ -540,9 +536,10 @@ _HANDLERS: dict[str, Callable[..., CostEstimate]] = {
     # Latency-bound sequential-scan kernel: duration from the declared
     # per-token latency model (see _gdn_cost), not a roofline leg.
     "gated_delta_rule": _gdn_cost,
-    # SLA2 branch fusions (multi_head_moe): modeled entirely by the
-    # operator-performance-models package (fwd/grad families); needs chip
-    # capabilities, so nodes stay cost_unknown without a hardware profile.
+    # SLA2 branch fusions (multi_head_moe, opt-in via enable_sla2_fusion):
+    # modeled entirely by the operator-performance-models package (fwd/grad
+    # families); needs chip capabilities, so nodes stay cost_unknown without
+    # a hardware profile. Inert in the default eager mode (no such nodes).
     "sla2_sparse_attention": _sla2_sparse_attention_cost,
     "sla2_linear_attention": _sla2_linear_attention_cost,
     # Collectives: logical cross-rank volume only; duration awaits a link model.
@@ -694,12 +691,7 @@ def _annotate_node(node: OpNode, hardware) -> None:
         node.annotations.get("raw_op_type"),
         attrs=node.attrs,
     )
-    if cost.unknown or (
-        not cost.flops
-        and not cost.traffic_bytes
-        and not cost.comm_bytes
-        and cost.duration_us is None
-    ):
+    if cost.unknown or (not cost.flops and not cost.traffic_bytes and not cost.comm_bytes and cost.duration_us is None):
         node.annotations[_UNKNOWN_KEY] = True
         return
     if cost.flops:

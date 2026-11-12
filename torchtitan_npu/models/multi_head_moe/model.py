@@ -1,34 +1,52 @@
-# Copyright (c) 2026 Huawei Technologies Co., Ltd. All rights reserved.
+# Copyright (c) 2026 Huawei Technologies Co., Ltd. all rights reserved.
 #
 # This source code is licensed under the BSD-style license found in the
-# LICENSE file in the root directory of this source tree.
+# LICENSE file in the root directory of this tree.
 
 """SLA2Attention + Multi-Head-MoE decoder (MAGI-2 preview style).
 
-Ported from the external reference ``multi-head_moe.py`` (pure-PyTorch naive
-implementation). Deviations from the reference are recorded in the workspace
-adaptation log; the two structural ones:
+Faithful port of the external reference ``multi-head_moe.py`` (pure-PyTorch
+naive implementation). The SLA2 attention path executes the reference's own
+small eager operators (``apply_rotary_emb``, local ``RMSNorm``, block pooling,
+block router, soft top-k mask, the two attention branches and the alpha mix);
+nothing on that path is replaced by fused or virtual operators.
 
-- The reference ships latent shape bugs (RoPE broadcast, the linear-branch
-  einsum pair, the [B,S,H,D]/[B,H,T,D] layout mismatch between
-  ``SLA2Attention`` and ``InnerBlockSLA2``) that make it unrunnable; this port
-  implements the intended math with the layouts the reference docstrings
-  state.
-- The naive per-head/per-expert Python loop is expressed through the shared
-  token dispatcher + grouped-GEMM experts so the expert computation matches a
-  production MoE execution (dispatch -> grouped experts -> combine).
+Approved deviations from the reference (all documented, none substitutes an
+operator kind):
 
-The two SLA2 branch cores are module-level seams
-(``run_sla2_sparse_attention`` / ``run_sla2_linear_attention``) with eager
-reference fallbacks. A production NPU build binds fused kernels at these
-seams; the simulator's compat layer replaces them with virtual fused ops for
-Meta capture (``torchtitan_simulator.compat.multi_head_moe``).
+- Three latent shape bugs make the reference unrunnable; the intended math is
+  implemented with the layouts the reference docstrings state:
+  RoPE broadcasts ``freqs_cis`` over ``unsqueeze(1)`` (reference had
+  ``unsqueeze(2)``), the linear-branch einsum is ``"bhqk,bhkld->bhqld"``
+  (reference subscript was illegal), and ``SLA2Attention`` transposes at the
+  ``[B,S,H,D]/[B,H,T,D]`` boundary the reference crossed silently.
+- ``InnerBlockSLA2`` receives ``topk_blocks`` per call instead of caching it
+  in a lazily-constructed module (the reference caches the first call's
+  value, which goes stale when the sequence length changes).
+- Router/gate weights get a standard small-std normal init (the reference
+  leaves ``torch.empty`` buffers uninitialized); ``alpha`` stays at the
+  reference's 0.5.
+- The naive per-head/per-expert Python loop of the reference's Multi-Head-MoE
+  is expressed through the shared token dispatcher + grouped-GEMM experts in
+  BOTH modes (owner decision: the reference's ``bincount``/``torch.where``
+  cannot run under Meta capture — their output shapes depend on tensor
+  values — and grouped GEMM is the production expert execution).
+
+Fusion boundary: the two module-level seam functions
+``run_sla2_sparse_attention`` / ``run_sla2_linear_attention`` (the sparse and
+linear branch cores). Everything around them stays native dispatch in both
+modes: block pooling, block router, soft top-k mask, ``M_not = 1 - M_c``,
+padding/crop, the alpha branch mix, RoPE and the norms. The simulator's
+``SimulationConfig.enable_sla2_fusion`` switch (default OFF) replaces exactly
+these two functions with virtual fused ops for Meta capture
+(``torchtitan_simulator.compat.multi_head_moe``).
 
 Shape suffixes: B batch, S sequence, H attention heads, D model dim,
 Dh head dim, T tokens, Hm MoE heads, hs MoE head hidden, Es experts per
 head, Ks activated experts per head, E total routed experts.
 """
 
+import dataclasses
 from dataclasses import dataclass
 
 import spmd_types as spmd
@@ -40,8 +58,6 @@ from torchtitan.models.common.decoder_sharding import dense_param_placement
 from torchtitan.models.common.feed_forward import FeedForward
 from torchtitan.models.common.linear import Linear
 from torchtitan.models.common.moe import RoutedExperts
-from torchtitan.models.common.nn_modules import RMSNorm
-from torchtitan.models.common.rope import ComplexRoPE
 from torchtitan.protocols.module import Module
 from torchtitan.protocols.sharding import ShardingConfig
 
@@ -51,16 +67,84 @@ __all__ = [
     "MultiHeadGate",
     "MultiHeadMoE",
     "MultiHeadMoEModel",
+    "RMSNorm",
     "SLA2Attention",
     "TransformerBlock",
+    "apply_rotary_emb",
     "run_sla2_linear_attention",
     "run_sla2_sparse_attention",
 ]
 
 
+@dataclass(kw_only=True, slots=True)
+class RopeGeometry:
+    """RoPE geometry metadata the framework Decoder contract reads.
+
+    Pure configuration (``max_seq_len`` validation/cache bookkeeping); the
+    SLA2 path computes RoPE frequencies via the reference's
+    ``precompute_freqs_cis`` and builds no RoPE module.
+    """
+
+    max_seq_len: int = 4096
+
+
 def _replicated_sharding(parameter: str) -> ShardingConfig:
     """Replicated state placement for model-owned plain parameters."""
     return ShardingConfig(state_shardings={parameter: dense_param_placement(tp=spmd.R)})
+
+
+def _apply_rotary_emb_math(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
+    x_c = torch.view_as_complex(x.float().reshape(*x.shape[:-1], -1, 2))
+    out = torch.view_as_real(x_c * freqs_cis.unsqueeze(1)).flatten(3)
+    return out.type_as(x)
+
+
+def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
+    """Reference ``apply_rotary_emb``; ``unsqueeze(1)`` fixes its broadcast bug.
+
+    The reference multiplies by ``freqs_cis.unsqueeze(2)`` while ``freqs_cis``
+    is ``[S, Dh/2]`` and ``x`` is ``[B, S, H, Dh]``; dim 1 is the sequence
+    axis, so ``unsqueeze(1)`` is the broadcast the docstrings intend. The
+    reference disables autocast around the math; Meta tensors carry no
+    autocast state, so Meta capture skips that context (behavior-identical:
+    there is nothing to disable) while real devices keep it.
+    """
+    if x.device.type == "meta":
+        return _apply_rotary_emb_math(x, freqs_cis)
+    with torch.amp.autocast(x.device.type, enabled=False):
+        return _apply_rotary_emb_math(x, freqs_cis)
+
+
+class RMSNorm(Module):
+    """Reference RMSNorm: ``x * rsqrt(mean(x^2) + eps) * weight`` in fp32."""
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(Module.Config):
+        dim: int
+        eps: float = 1e-6
+
+        def __post_init__(self) -> None:
+            if self.sharding_config is None:
+                self.sharding_config = _replicated_sharding("weight")
+
+    def __init__(self, config: Config):
+        super().__init__()
+        self.eps = config.eps
+        self.weight = torch.nn.Parameter(torch.ones(config.dim))
+
+    def reset_parameters(self) -> None:
+        # Reference init: ``torch.ones(dim)``.
+        torch.nn.init.ones_(self.weight)
+
+    def _norm(self, x: torch.Tensor) -> torch.Tensor:
+        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        output = self._norm(x.float()).type_as(x)
+        return output * self.weight
+
+
+# ========== 内联块SLA2核心实现（带自动padding，源码小算子） ==========
 
 
 def run_sla2_sparse_attention(
@@ -70,23 +154,22 @@ def run_sla2_sparse_attention(
     block_mask_BHqq: torch.Tensor,
     selected_blocks: int,
 ) -> torch.Tensor:
-    """Eager reference for the SLA2 sparse (block-selected softmax) branch.
+    """Fusion boundary of the SLA2 sparse (block-selected softmax) branch.
 
-    ``block_mask_BHqq`` holds the soft block-selection weights M_c; blocks
-    below the 1e-6 threshold are masked out of the row softmax with the
-    reference's -1e9 fill. ``selected_blocks`` is the per-row count of key
-    blocks the production fused kernel computes (aclnnBlockSparseAttention
-    semantics); this eager fallback materializes the full score matrix and
-    is correctness-only, so it ignores the count. The 1/sqrt(Dh) score
-    scaling is applied by the caller so the fusion boundary carries tensors
-    plus plain scalars only.
+    Default eager path: the reference's own small operators below (full score
+    matrix, 1/sqrt(Dh) scaling after the score matmul, -1e9 fill, softmax).
+    ``selected_blocks`` is the per-row selected key-block count consumed by
+    the opt-in fused boundary (``SimulationConfig.enable_sla2_fusion``); the
+    eager math materializes the full matrix and ignores the count.
     """
     bs = q_BHTD.size(-2) // block_mask_BHqq.size(-2)
-    mask_BHTT = block_mask_BHqq.unsqueeze(3).unsqueeze(-1).expand(-1, -1, -1, bs, -1, bs).flatten(2, 3).flatten(-2, -1)
-    attn_score = torch.matmul(q_BHTD, k_BHTD.transpose(-1, -2))
-    attn_score = attn_score.masked_fill(mask_BHTT < 1e-6, -1e9)
-    attn_weight = F.softmax(attn_score, dim=-1)
-    return torch.matmul(attn_weight, v_BHTD)
+    mask_c_exp = block_mask_BHqq.unsqueeze(3).unsqueeze(-1)
+    mask_c_exp = mask_c_exp.expand(-1, -1, -1, bs, -1, bs)
+    mask_c_exp = mask_c_exp.flatten(2, 3).flatten(-2, -1)
+    attn_score = torch.matmul(q_BHTD, k_BHTD.transpose(-1, -2)) / (q_BHTD.size(-1) ** 0.5)
+    attn_score = attn_score.masked_fill(mask_c_exp < 1e-6, -1e9)
+    attn_weight_s = F.softmax(attn_score, dim=-1)
+    return torch.matmul(attn_weight_s, v_BHTD)
 
 
 def run_sla2_linear_attention(
@@ -96,22 +179,22 @@ def run_sla2_linear_attention(
     complement_mask_BHqq: torch.Tensor,
     selected_blocks: int,
 ) -> torch.Tensor:
-    """Eager reference for the SLA2 linear (softmax-feature) branch.
+    """Fusion boundary of the SLA2 linear (softmax-feature) branch.
 
-    Per query block, a KV state is accumulated over the complement-masked key
-    blocks (``M_not = 1 - M_c``), then every token reads its block state and
-    normalizes by the matching feature mass. ``selected_blocks`` is the
-    per-row count of complement key blocks the production fused kernel
-    accumulates over (convention name, no public CANN anchor); the fallback
-    materializes the per-block states eagerly and ignores the count.
+    Default eager path: per query block, a KV state is accumulated over the
+    complement-masked key blocks (``M_not = 1 - M_c``), then every token reads
+    its block state and normalizes by the matching feature mass (einsum fixed
+    per the documented bug). ``selected_blocks`` is the per-row complement
+    key-block count consumed by the opt-in fused boundary; the eager math
+    materializes the per-block states and ignores the count.
     """
     B, H, T, Dh = q_BHTD.shape
     bs = T // complement_mask_BHqq.size(-2)
+    nb = complement_mask_BHqq.size(-2)
     phi_q = F.softmax(q_BHTD, dim=-1)
     phi_k = F.softmax(k_BHTD, dim=-1)
-    phi_k_blk = phi_k.view(B, H, -1, bs, Dh)
-    phi_v_blk = v_BHTD.view(B, H, -1, bs, Dh)
-    # per query block: weight every key block's features by the complement mask
+    phi_k_blk = phi_k.view(B, H, nb, bs, Dh)
+    phi_v_blk = v_BHTD.view(B, H, nb, bs, Dh)
     phi_k_masked = torch.einsum("bhqk,bhkld->bhqld", complement_mask_BHqq, phi_k_blk)
     phi_v_masked = torch.einsum("bhqk,bhkld->bhqld", complement_mask_BHqq, phi_v_blk)
     kv_state = torch.matmul(phi_k_masked.transpose(-1, -2), phi_v_masked)
@@ -148,11 +231,13 @@ class BlockRouter(Module):
 class InnerBlockSLA2(Module):
     """The SLA2 core: block-sparse softmax branch + masked linear branch.
 
-    Inputs and outputs are [B, H, T, Dh] with T already a multiple of the
-    block size (the caller pads); there is no causal mask (reference
-    docstring: "无因果mask"). The soft top-k block mask M_c is computed here
-    and handed to the two branch seams; the alpha fusion stays outside the
-    seams so both branch gradients stay dispatcher-visible.
+    Inputs and outputs are ``[B, H, T, Dh]``; padding to a block multiple and
+    the final crop happen here exactly like the reference. There is no causal
+    mask (reference docstring: "无因果mask"). The alpha branch mix stays
+    inside the core on the ``[B, H, T, D]`` head axis, like the reference.
+    The two branch computations live in the module-level seam functions
+    (the fusion boundary); this forward owns pooling, routing, masking and
+    the mix.
     """
 
     @dataclass(kw_only=True, slots=True)
@@ -194,10 +279,11 @@ class InnerBlockSLA2(Module):
         if self.training:
             logits = score_BHqq / self.temp
             gumbel = -torch.log(-torch.log(torch.rand_like(logits) + 1e-10) + 1e-10)
-            soft = F.softmax(logits + gumbel, dim=-1)
-            vals, _ = torch.topk(soft, k=topk_blocks, dim=-1)
+            logits = logits + gumbel
+            soft_mask = F.softmax(logits, dim=-1)
+            vals, _ = torch.topk(soft_mask, k=topk_blocks, dim=-1)
             thresh = vals[..., [-1]]
-            return torch.sigmoid((soft - thresh) / self.temp)
+            return torch.sigmoid((soft_mask - thresh) / self.temp)
         _, top_idx = torch.topk(score_BHqq, k=topk_blocks, dim=-1)
         mask = torch.zeros_like(score_BHqq)
         mask.scatter_(-1, top_idx, 1.0)
@@ -211,11 +297,15 @@ class InnerBlockSLA2(Module):
         *,
         topk_blocks: int,
     ) -> torch.Tensor:
-        B, H, T, Dh = q_BHTD.shape
+        B, H, T_orig, Dh = q_BHTD.shape
         bs = self.block_size
-        if T % bs:
-            raise ValueError(f"SLA2 core expects block-padded inputs, got seq {T} with block {bs}")
-        nb = T // bs
+        pad_len = (bs - (T_orig % bs)) % bs
+        if pad_len > 0:
+            q_BHTD = F.pad(q_BHTD, (0, 0, 0, pad_len), value=0.0)
+            k_BHTD = F.pad(k_BHTD, (0, 0, 0, pad_len), value=0.0)
+            v_BHTD = F.pad(v_BHTD, (0, 0, 0, pad_len), value=0.0)
+        T_pad = q_BHTD.size(2)
+        nb = T_pad // bs
         if not 1 <= topk_blocks <= nb:
             raise ValueError(f"topk_blocks must be in [1, {nb}], got {topk_blocks}")
 
@@ -223,22 +313,30 @@ class InnerBlockSLA2(Module):
         k_pool = k_BHTD.view(B, H, nb, bs, Dh).mean(dim=-2)
         score_BHqq = self.router(q_pool, k_pool)
         mask_c = self._soft_topk_mask(score_BHqq, topk_blocks)
+        mask_not = 1.0 - mask_c
 
-        out_sparse = run_sla2_sparse_attention(q_BHTD * (Dh**-0.5), k_BHTD, v_BHTD, mask_c, topk_blocks)
-        out_linear = run_sla2_linear_attention(q_BHTD, k_BHTD, v_BHTD, 1.0 - mask_c, nb - topk_blocks)
+        # The two branch seams are the fusion boundary: eager small operators
+        # by default; the simulator's opt-in ``enable_sla2_fusion`` replaces
+        # exactly these two functions with virtual fused ops for capture.
+        out_sparse = run_sla2_sparse_attention(q_BHTD, k_BHTD, v_BHTD, mask_c, topk_blocks)
+        out_linear = run_sla2_linear_attention(q_BHTD, k_BHTD, v_BHTD, mask_not, nb - topk_blocks)
 
-        # per-head branch mix on the [B, H, T, D] head axis
-        alpha = torch.sigmoid(self.alpha).unsqueeze(0).unsqueeze(-1)
-        return alpha * out_sparse + (1.0 - alpha) * out_linear
+        # fusion: per-head branch mix on the [B, H, T, D] head axis
+        alpha = torch.sigmoid(self.alpha)
+        out = alpha.unsqueeze(0).unsqueeze(-1) * out_sparse + (1.0 - alpha.unsqueeze(0).unsqueeze(-1)) * out_linear
+
+        if pad_len > 0:
+            out = out[:, :, :T_orig, :]
+        return out
 
 
 class SLA2Attention(Module):
     """SLA2 attention: QKV projections, per-head QK-norm, RoPE, SLA2 core.
 
-    The reference feeds ``InnerBlockSLA2`` a [B, S, H, Dh] tensor while the
-    core (and its own docstring) expects [B, H, T, Dh]; this port transposes
-    at the boundary and pads the sequence to a block multiple here so the
-    core sees fixed geometry.
+    The reference feeds ``InnerBlockSLA2`` a ``[B, S, H, Dh]`` tensor while
+    the core (and its own docstring) expects ``[B, H, T, Dh]``; this port
+    transposes at the boundary (documented fix). RoPE is the reference's own
+    complex-multiply ``apply_rotary_emb``.
     """
 
     @dataclass(kw_only=True, slots=True)
@@ -246,9 +344,11 @@ class SLA2Attention(Module):
         n_heads: int
         head_dim: int
         block_size: int
+        rope_theta: float = 10000.0
+        # Framework-contract metadata only (see RopeGeometry); never built.
+        rope: RopeGeometry = dataclasses.field(default_factory=RopeGeometry)
         sla2_topk_ratio_1m: float = 0.005
         sla2_topk_ratio_5m: float = 0.001
-        rope: ComplexRoPE.Config
         to_q: Linear.Config
         to_k: Linear.Config
         to_v: Linear.Config
@@ -268,6 +368,7 @@ class SLA2Attention(Module):
         self.n_heads = config.n_heads
         self.head_dim = config.head_dim
         self.block_size = config.block_size
+        self.rope_theta = config.rope_theta
         self.sla2_topk_ratio_1m = config.sla2_topk_ratio_1m
         self.sla2_topk_ratio_5m = config.sla2_topk_ratio_5m
 
@@ -277,10 +378,9 @@ class SLA2Attention(Module):
         self.to_out = config.to_out.build()
         self.norm_q = config.norm_q.build()
         self.norm_k = config.norm_k.build()
-        self.rope = config.rope.build()
         self.inner = config.inner.build()
 
-    def _topk_blocks(self, seq_len: int) -> int:
+    def _get_topk_blocks(self, seq_len: int) -> int:
         ratio = self.sla2_topk_ratio_1m if seq_len <= 1_000_000 else self.sla2_topk_ratio_5m
         num_blk = seq_len // self.block_size
         return max(1, int(num_blk * ratio))
@@ -288,29 +388,23 @@ class SLA2Attention(Module):
     def forward(
         self,
         x_BSD: torch.Tensor,
-        attention_masks: object | None = None,
-        positions: torch.Tensor | None = None,
+        rotary_emb: torch.Tensor,
     ) -> torch.Tensor:
-        B, S, _ = x_BSD.shape
-        q = self.to_q(x_BSD).view(B, S, self.n_heads, self.head_dim)
-        k = self.to_k(x_BSD).view(B, S, self.n_heads, self.head_dim)
-        v = self.to_v(x_BSD).view(B, S, self.n_heads, self.head_dim)
+        _, S, _ = x_BSD.shape
+        q = self.to_q(x_BSD).unflatten(2, (self.n_heads, self.head_dim))
+        k = self.to_k(x_BSD).unflatten(2, (self.n_heads, self.head_dim))
+        v = self.to_v(x_BSD).unflatten(2, (self.n_heads, self.head_dim))
 
-        q, k = self.rope(self.norm_q(q), self.norm_k(k), positions)
+        q = apply_rotary_emb(self.norm_q(q), rotary_emb)
+        k = apply_rotary_emb(self.norm_k(k), rotary_emb)
 
-        # [B, H, T, Dh] for the SLA2 core, padded to a block multiple
-        pad = (self.block_size - (S % self.block_size)) % self.block_size
+        # [B, H, T, Dh] for the SLA2 core (documented layout fix)
         q_BHTD = q.transpose(1, 2)
         k_BHTD = k.transpose(1, 2)
         v_BHTD = v.transpose(1, 2)
-        if pad:
-            q_BHTD = F.pad(q_BHTD, (0, 0, 0, pad))
-            k_BHTD = F.pad(k_BHTD, (0, 0, 0, pad))
-            v_BHTD = F.pad(v_BHTD, (0, 0, 0, pad))
 
-        out_BHTD = self.inner(q_BHTD, k_BHTD, v_BHTD, topk_blocks=self._topk_blocks(S))
-        out_BSHD = out_BHTD[:, :, :S, :].transpose(1, 2)
-        return self.to_out(out_BSHD.reshape(B, S, -1))
+        out_BHTD = self.inner(q_BHTD, k_BHTD, v_BHTD, topk_blocks=self._get_topk_blocks(S))
+        return self.to_out(out_BHTD.transpose(1, 2).flatten(2, 3).type_as(x_BSD))
 
 
 class MultiHeadGate(Module):
@@ -382,6 +476,8 @@ class MultiHeadMoE(Module):
     flattens (head, expert) into one expert id (head * Es + expert) and reuses
     the shared RoutedExperts (token dispatcher + grouped experts): the head
     axis of the projected subspace becomes the dispatcher's sequence axis.
+    Owner decision: grouped GEMM in BOTH capture modes (the reference's
+    ``bincount``/``torch.where`` loop cannot run under Meta capture).
     """
 
     @dataclass(kw_only=True, slots=True)
@@ -449,7 +545,11 @@ class MultiHeadMoE(Module):
 
 
 class TransformerBlock(Module):
-    """Decoder block: SLA2 attention + dense FFN or Multi-Head MoE."""
+    """Decoder block: SLA2 attention + dense FFN or Multi-Head MoE.
+
+    Residual layout matches the reference: ``h = x + attn(norm(x))`` then
+    ``out = h + ffn(norm(h))``.
+    """
 
     @dataclass(kw_only=True, slots=True)
     class Config(Module.Config):
@@ -474,13 +574,8 @@ class TransformerBlock(Module):
         else:
             self.feed_forward = config.feed_forward.build()  # pyrefly: ignore [missing-attribute]
 
-    def forward(
-        self,
-        x_BLD: torch.Tensor,
-        attention_masks: object | None = None,
-        positions: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        h = x_BLD + self.attention(self.attention_norm(x_BLD), attention_masks, positions)
+    def forward(self, x_BLD: torch.Tensor, rotary_emb: torch.Tensor) -> torch.Tensor:
+        h = x_BLD + self.attention(self.attention_norm(x_BLD), rotary_emb)
         h_normed = self.ffn_norm(h)
         if self.moe_enabled:
             return h + self.moe(h_normed)  # pyrefly: ignore [missing-attribute]
@@ -490,9 +585,16 @@ class TransformerBlock(Module):
 class MultiHeadMoEModel(Decoder):
     """SLA2Attention + Multi-Head-MoE autoregressive decoder.
 
-    Forward layout follows ``Decoder``: embeddings -> blocks -> norm -> lm_head
-    (the head is executed by the loss when ``_skip_lm_head`` is set). SLA2
-    uses no causal attention mask, so the input seam only carries positions.
+    ``forward`` follows the reference ``HybridMultiHeadMoEModel.forward``
+    literally: embeddings -> ``precompute_freqs_cis`` once -> layers ->
+    ``norm_final`` -> ``lm_head``. The runner's ``positions`` seam is accepted
+    and ignored (the reference derives RoPE frequencies from the sequence
+    length); this family is DP/FSDP/EP only (TP is rejected at config level,
+    CP in ``build_attention_masks``), so the framework's PP/metadata plumbing
+    has no consumer here. Framework attribute names are kept
+    (``tok_embeddings``/``norm``/``lm_head`` = reference
+    ``embeddings``/``norm_final``/``lm_head``); the head is executed by the
+    loss when ``_skip_lm_head`` is set.
     """
 
     @dataclass(kw_only=True, slots=True)
@@ -547,6 +649,36 @@ class MultiHeadMoEModel(Decoder):
                     ffn = layer.feed_forward
                     active += 3 * ffn.w1.out_features * ffn.w1.in_features
             return nparams, 6 * active * seq_len
+
+    @torch.no_grad()
+    def precompute_freqs_cis(self, seq_len: int, device):
+        # Reference ``precompute_freqs_cis``; geometry comes from the (shared)
+        # SLA2 attention config.
+        attn = next(iter(self.layers.values())).attention
+        dim = attn.head_dim
+        theta = attn.rope_theta
+        freqs = 1.0 / (theta ** (torch.arange(0, dim, 2, dtype=torch.float32, device=device) / dim))
+        t = torch.arange(seq_len, dtype=torch.float32, device=device)
+        freqs = torch.outer(t, freqs)
+        return torch.polar(torch.ones_like(freqs), freqs)
+
+    def forward(
+        self,
+        tokens: torch.Tensor,
+        positions: torch.Tensor | None = None,
+        attention_masks: object | None = None,
+        *,
+        attention_metadata=None,
+    ) -> torch.Tensor:
+        del positions, attention_masks, attention_metadata  # maskless family; see docstring
+        x = self.tok_embeddings(tokens)
+        freqs_cis = self.precompute_freqs_cis(x.size(1), device=x.device)
+        for layer in self.layers.values():
+            x = layer(x, rotary_emb=freqs_cis)
+        x = self.norm(x) if self.norm is not None else x
+        if self._skip_lm_head:
+            return x
+        return self.lm_head(x) if self.lm_head is not None else x
 
     def build_attention_masks(self, tokens, labels, extra_inputs, *, cp_mesh=None, load_balancer_type=None):
         """SLA2 has no causal mask; positions pass through unchanged.

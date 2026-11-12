@@ -16,7 +16,9 @@ matrix and per-block states, which misrepresents the architecture's
 execution, so the simulator exposes the two fused boundaries as virtual
 custom ops with fake Meta kernels and explicit backward ops — the same
 pattern as Kimi's ``kimi_sim`` and Qwen3.5's ``qwen3_5_sim`` fusions.
-Real-device calls fail explicitly.
+Real-device calls fail explicitly. Installation is opt-in: the simulator
+replaces the seams only when ``SimulationConfig.enable_sla2_fusion`` is set
+(default off, eager reference operators).
 
 Everything around the fusion stays native dispatch: block pooling, the block
 router (its projections are real parameters), the gumbel soft top-k mask,

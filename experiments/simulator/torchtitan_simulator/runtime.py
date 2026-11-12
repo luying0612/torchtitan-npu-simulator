@@ -46,12 +46,12 @@ class RuntimeSession:
             self.capabilities["qwen3_5_gdn_meta_bridge"] = (
                 "dispatcher Meta/autograd; Triton GDN fusion boundary and text input adapter"
             )
-        if prepared.trainer.model_spec.name == "multi_head_moe":
+        if prepared.trainer.model_spec.name == "multi_head_moe" and prepared.simulation.enable_sla2_fusion:
             from torchtitan_simulator.compat.multi_head_moe import install_multi_head_moe_meta_support
 
             install_multi_head_moe_meta_support(self.patches)
             self.capabilities["multi_head_moe_sla2_virtual_fusions"] = (
-                "dispatcher Meta/autograd; sparse and linear SLA2 branch fusion boundaries"
+                "dispatcher Meta/autograd; opt-in sparse and linear SLA2 branch fusion boundaries"
             )
         if prepared.trainer.model_spec.name == "deepseek_v4_1":
             from torchtitan_simulator.compat.deepseek_v4_1 import (

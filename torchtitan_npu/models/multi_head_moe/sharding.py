@@ -24,7 +24,6 @@ import spmd_types as spmd
 from torchtitan.models.common.decoder_sharding import (
     dense_activation_placement,
     dense_param_placement,
-    norm_config,
     set_decoder_sharding_config,
     set_dense_ffn_sharding,
 )
@@ -60,9 +59,6 @@ def set_multi_head_moe_sharding_config(config: "MultiHeadMoEModel.Config", *, en
     set_decoder_sharding_config(config, enable_sp=False)
     for layer_cfg in config.layers:
         attention = layer_cfg.attention
-        attention.rope.sharding_config = ShardingConfig(
-            state_shardings={"cache": dense_param_placement(tp=spmd.R)},
-        )
         for linear in (attention.to_q, attention.to_k, attention.to_v, attention.to_out):
             linear.sharding_config = _replicated_param_sharding("weight")
         attention.norm_q.sharding_config = _replicated_param_sharding("weight")
@@ -72,9 +68,8 @@ def set_multi_head_moe_sharding_config(config: "MultiHeadMoEModel.Config", *, en
         # InnerBlockSLA2.alpha and MultiHeadGate.router carry default
         # replicated sharding configs on their own Config classes.
 
-        block_norm = norm_config(enable_sp=False)
-        layer_cfg.attention_norm.sharding_config = block_norm
-        layer_cfg.ffn_norm.sharding_config = block_norm
+        layer_cfg.attention_norm.sharding_config = _replicated_param_sharding("weight")
+        layer_cfg.ffn_norm.sharding_config = _replicated_param_sharding("weight")
 
         if layer_cfg.feed_forward is not None:
             set_dense_ffn_sharding(

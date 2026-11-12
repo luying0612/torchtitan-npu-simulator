@@ -28,9 +28,7 @@ from torchtitan.models.common.embedding import Embedding
 from torchtitan.models.common.feed_forward import FeedForward
 from torchtitan.models.common.linear import Linear
 from torchtitan.models.common.moe import GroupedExperts, LocalTokenDispatcher, RoutedExperts
-from torchtitan.models.common.nn_modules import RMSNorm
 from torchtitan.models.common.param_init import depth_scaled_std
-from torchtitan.models.common.rope import ComplexRoPE
 from torchtitan.protocols.model_spec import ModelSpec
 from torchtitan.trainer import Trainer
 
@@ -40,6 +38,8 @@ from .model import (
     MultiHeadGate,
     MultiHeadMoE,
     MultiHeadMoEModel,
+    RMSNorm,
+    RopeGeometry,
     SLA2Attention,
     TransformerBlock,
 )
@@ -62,7 +62,7 @@ def _sla2_attention_config(
     temp: float,
 ) -> SLA2Attention.Config:
     def _head_norm() -> RMSNorm.Config:
-        return RMSNorm.Config(normalized_shape=head_dim, eps=norm_eps)
+        return RMSNorm.Config(dim=head_dim, eps=norm_eps)
 
     def _head_linear() -> _LIN:
         return _LIN(in_features=dim, out_features=n_heads * head_dim, bias=False)
@@ -73,7 +73,8 @@ def _sla2_attention_config(
         block_size=block_size,
         sla2_topk_ratio_1m=sla2_topk_ratio_1m,
         sla2_topk_ratio_5m=sla2_topk_ratio_5m,
-        rope=ComplexRoPE.Config(dim=head_dim, max_seq_len=max_seq_len, theta=rope_theta),
+        rope_theta=rope_theta,
+        rope=RopeGeometry(max_seq_len=max_seq_len),
         to_q=_head_linear(),
         to_k=_head_linear(),
         to_v=_head_linear(),
@@ -158,8 +159,8 @@ def _layer_config(
     is_dense = layer_idx < 2 or layer_idx >= n_layers - 2
     return TransformerBlock.Config(
         attention=_sla2_attention_config(**attn_kwargs),
-        attention_norm=RMSNorm.Config(normalized_shape=dim, eps=norm_eps),
-        ffn_norm=RMSNorm.Config(normalized_shape=dim, eps=norm_eps),
+        attention_norm=RMSNorm.Config(dim=dim, eps=norm_eps),
+        ffn_norm=RMSNorm.Config(dim=dim, eps=norm_eps),
         feed_forward=(
             FeedForward.Config(
                 w1=_LIN(in_features=dim, out_features=inter_dim, bias=False),
@@ -221,7 +222,7 @@ def _make_model_config(
             num_embeddings=vocab_size,
             embedding_dim=dim,
         ),
-        norm=RMSNorm.Config(normalized_shape=dim, eps=norm_eps),
+        norm=RMSNorm.Config(dim=dim, eps=norm_eps),
         lm_head=_LIN(in_features=dim, out_features=vocab_size, bias=False),
         layers=[
             _layer_config(

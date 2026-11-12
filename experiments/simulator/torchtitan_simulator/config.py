@@ -44,6 +44,9 @@ class SimulationConfig:
     memory_parameter_storage_dtype: str = ""
     memory_offload_ac_saved_tensors: bool = False
     memory_offload_optimizer_states: bool = False
+    # Opt-in virtual SLA2 branch fusions for multi_head_moe capture. Default
+    # off: the model runs the reference's own eager operators.
+    enable_sla2_fusion: bool = False
     local_batch_size: int | None = None
     global_batch_size: int | None = None
     enable_quantized_training: bool = False
@@ -53,6 +56,8 @@ class SimulationConfig:
     def validate(self):
         if type(self.memory_offload_optimizer_states) is not bool:
             raise ValueError("memory_offload_optimizer_states must be boolean")
+        if type(self.enable_sla2_fusion) is not bool:
+            raise ValueError("enable_sla2_fusion must be boolean")
         preset, separator, precision = self.config.rpartition("_baseline_")
         if (
             separator
