@@ -205,7 +205,9 @@ class HeadParallelMultiHeadMoE(MultiHeadMoE):
         # in the torchtitan mesh); head ownership is a runtime slice. The
         # parameter is tiny next to the expert pool, so the memory cost of
         # replication is negligible and the communication facts (two static
-        # all-to-alls per MoE layer) are unchanged.
+        # data all-to-alls per MoE layer, plus the fixed-size token-count
+        # validation all-gather described in the module docstring) are
+        # unchanged.
         ep_mesh = self._ep_mesh()
         router = _local(self.router.router)
         if ep_mesh is None or ep_mesh.size() == 1:
